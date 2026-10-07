@@ -1,11 +1,9 @@
-Flask==3.0.3
-
-torch
-torchvision
-
-numpy
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
+numpy==1.26.4
 Pillow
-
-opencv-python-headless
-
+opencv-python-headless==4.10.0.84
+Flask==3.0.3
 gdown
+gunicorn
