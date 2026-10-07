@@ -1,9 +1,11 @@
 import sys
 import os
+import gc
 import json
 import uuid
 import time
 import math
+import threading
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, BASE_DIR)
@@ -20,6 +22,8 @@ from werkzeug.utils import secure_filename
 from webapp.gradcam import GradCAM
 from models.agpn_resnet import AGPNResNet50
 
+torch.set_num_threads(1)
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-in-production")
 
@@ -29,16 +33,16 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-in-produc
 ALLOWED_EXTENSIONS  = {"jpg", "jpeg", "png", "webp"}
 MAX_FILE_BYTES      = 10 * 1024 * 1024
 IMAGE_SIZE          = 224
+MAX_SIDE            = 1024     # downscale big phone photos before processing (saves RAM)
 TEMPERATURE         = 1.4      # confidence calibration — Guo et al. 2017
 ENTROPY_REJECT_THR  = 1.2      # max entropy for 5-class = ln(5) ≈ 1.61
 LOW_CONF_THR        = 50.0     # below this → no cattle
 UNKNOWN_CONF_THR    = 75.0     # 50–75 → unknown breed
 HISTORY_MAX         = 5
 
-UPLOAD_FOLDER  = os.path.join(os.path.dirname(__file__), "static", "uploads")
-HEATMAP_FOLDER = os.path.join(os.path.dirname(__file__), "static", "heatmaps")
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "agpn_model.pth")
-CLASS_FILE     = os.path.join(BASE_DIR, "class_names.json")
+MODEL_URL  = "https://drive.google.com/uc?id=1UmDf7rhDRkoAj_PKQMPgvYGicH5adK8C"
+CLASS_FILE = os.path.join(BASE_DIR, "class_names.json")
 
 DEFAULT_CLASSES = [
     "Ayrshire cattle",
@@ -48,7 +52,7 @@ DEFAULT_CLASSES = [
     "Red Dane cattle",
 ]
 
-UPLOAD_FOLDER = os.path.join(app.root_path, "static", "uploads")
+UPLOAD_FOLDER  = os.path.join(app.root_path, "static", "uploads")
 HEATMAP_FOLDER = os.path.join(app.root_path, "static", "heatmaps")
 
 os.makedirs(UPLOAD_FOLDER,  exist_ok=True)
@@ -73,34 +77,53 @@ else:
 print(f"[App] Classes: {class_names}")
 
 # ─────────────────────────────────────────────
-# MODEL
+# MODEL + GRAD-CAM  (lazy: loaded on first prediction, not at boot)
 # ─────────────────────────────────────────────
-import gdown
+_model     = None
+_gradcam   = None
+_load_lock = threading.Lock()
 
-model = AGPNResNet50(num_classes=len(class_names))
 
-os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+def get_model():
+    global _model, _gradcam
+    if _model is not None:
+        return _model, _gradcam
 
-if not os.path.exists(MODEL_PATH):
-    print("[App] Downloading model from Google Drive...")
-    url = "https://drive.google.com/uc?id=1UmDf7rhDRkoAj_PKQMPgvYGicH5adK8C"
-    gdown.download(url, MODEL_PATH, quiet=False)
+    with _load_lock:
+        if _model is None:
+            os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
 
-try:
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    print(f"[App] Loaded weights from {MODEL_PATH}")
-except Exception as e:
-    print(f"[App] ERROR loading model: {e}")
-    raise RuntimeError("Model failed to load. Check download or file integrity.")
+            if not os.path.exists(MODEL_PATH):
+                import gdown
+                print("[App] Downloading model from Google Drive...")
+                gdown.download(MODEL_URL, MODEL_PATH, quiet=True)
 
-model = model.to(device)
-model.eval()
+            m = AGPNResNet50(num_classes=len(class_names))
 
-# ─────────────────────────────────────────────
-# GRAD-CAM
-# ─────────────────────────────────────────────
-target_layer = model.backbone.layer4[-1]
-gradcam      = GradCAM(model, target_layer)
+            try:
+                try:
+                    # mmap = weights are read from disk on demand, no second full copy in RAM
+                    state = torch.load(MODEL_PATH, map_location="cpu",
+                                       mmap=True, weights_only=True)
+                except Exception as e:
+                    print(f"[App] mmap load failed ({e}), falling back to normal load")
+                    state = torch.load(MODEL_PATH, map_location="cpu")
+                m.load_state_dict(state)
+                del state
+                print(f"[App] Loaded weights from {MODEL_PATH}")
+            except Exception as e:
+                print(f"[App] ERROR loading model: {e}")
+                raise RuntimeError("Model failed to load. Check download or file integrity.")
+
+            m = m.to(device)
+            m.eval()
+            gc.collect()
+
+            _gradcam = GradCAM(m, m.backbone.layer4[-1])
+            _model   = m
+
+    return _model, _gradcam
+
 
 # ─────────────────────────────────────────────
 # IMAGE TRANSFORM
@@ -126,6 +149,8 @@ def compute_entropy(probs: torch.Tensor) -> float:
 
 
 def calibrated_predict(batch: torch.Tensor) -> dict:
+    model, _ = get_model()
+
     with torch.no_grad():
         logits = model(batch)
         if logits.dim() == 2 and logits.size(0) > 1:
@@ -183,43 +208,31 @@ def calibrated_predict(batch: torch.Tensor) -> dict:
     }
 
 
-def generate_heatmap(pil_img, original_img_path, class_idx, save_path):
+def generate_heatmap(pil_img, class_idx, save_path):
     """
-    Generate a Grad-CAM heatmap overlay and save it to save_path.
+    Grad-CAM overlay saved to save_path. Uses the (already downscaled) PIL
+    image directly instead of re-reading the full-size file from disk.
+    Any failure falls back to the plain resized image, never a broken 404.
+    """
+    base     = np.array(pil_img.resize((IMAGE_SIZE, IMAGE_SIZE)))
+    original = cv2.cvtColor(base, cv2.COLOR_RGB2BGR)
 
-    Key fixes vs previous version:
-      - Removed requires_grad_(True) on the input tensor — Grad-CAM hooks
-        capture gradients from layer activations, not the input.
-      - Removed model.zero_grad() here — GradCAM.generate() calls it
-        internally BEFORE the forward pass, which is the correct order.
-      - Added try/except so a Grad-CAM failure never crashes the whole
-        prediction — it falls back to saving the plain resized original.
-    """
     try:
+        _, gradcam = get_model()
         cam_tensor = transform(pil_img).unsqueeze(0).to(device)
         cam_map    = gradcam.generate(cam_tensor, class_idx)
-
-        original = cv2.imread(original_img_path)
-        if original is None:
-            # imread can return None if the path has unicode chars or
-            # the file was not fully flushed yet — fall back to PIL
-            pil_arr  = np.array(pil_img.resize((IMAGE_SIZE, IMAGE_SIZE)))
-            original = cv2.cvtColor(pil_arr, cv2.COLOR_RGB2BGR)
-        else:
-            original = cv2.resize(original, (IMAGE_SIZE, IMAGE_SIZE))
 
         heatmap = cv2.applyColorMap(np.uint8(255 * cam_map), cv2.COLORMAP_JET)
         overlay = cv2.addWeighted(original, 0.6, heatmap, 0.4, 0)
         cv2.imwrite(save_path, overlay)
         print(f"[GradCAM] Heatmap saved → {save_path}")
+        del cam_tensor, cam_map, heatmap, overlay
 
     except Exception as exc:
-        # Grad-CAM failed — save plain resized image so the overlay slot
-        # is never a broken 404 in the browser
         print(f"[GradCAM] WARNING — heatmap generation failed: {exc}")
-        fallback = np.array(pil_img.resize((IMAGE_SIZE, IMAGE_SIZE)))
-        fallback = cv2.cvtColor(fallback, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(save_path, fallback)
+        cv2.imwrite(save_path, original)
+
+    gc.collect()
 
 
 # ─────────────────────────────────────────────
@@ -237,7 +250,12 @@ def about():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "device": str(device), "torch": torch.__version__})
+    return jsonify({
+        "status": "ok",
+        "device": str(device),
+        "torch": torch.__version__,
+        "model_loaded": _model is not None,
+    })
 
 
 @app.route("/predict", methods=["POST"])
@@ -275,6 +293,11 @@ def predict():
             session["predict_error"] = "Could not decode image. Please try another file."
             return redirect(url_for("result"))
 
+        orig_w, orig_h, orig_fmt = pil_img.width, pil_img.height, pil_img.format or "Unknown"
+
+        # shrink large photos before any processing (model input is 224x224 anyway)
+        pil_img.thumbnail((MAX_SIDE, MAX_SIDE))
+
         tensors.append(transform(pil_img))
 
         if first_path is None:
@@ -282,9 +305,9 @@ def predict():
             first_pil   = pil_img
             first_fname = filename
             image_meta  = {
-                "width":  pil_img.width,
-                "height": pil_img.height,
-                "format": pil_img.format or "Unknown",
+                "width":  orig_w,
+                "height": orig_h,
+                "format": orig_fmt,
             }
 
     if not tensors:
@@ -295,6 +318,10 @@ def predict():
     start_time = time.time()
     result     = calibrated_predict(batch)
     elapsed_ms = round((time.time() - start_time) * 1000, 1)
+    num_images = len(tensors)
+
+    del batch, tensors
+    gc.collect()
 
     if not result["cattle_detected"]:
         session["predict_error"] = result["rejection_reason"]
@@ -302,7 +329,7 @@ def predict():
 
     heatmap_fname = f"hm_{first_fname}"
     heatmap_path  = os.path.join(HEATMAP_FOLDER, heatmap_fname)
-    generate_heatmap(first_pil, first_path, result["top_class_idx"], heatmap_path)
+    generate_heatmap(first_pil, result["top_class_idx"], heatmap_path)
 
     history = session.get("prediction_history", [])
     history.insert(0, {
@@ -315,7 +342,7 @@ def predict():
     session["latest_result"] = {
         "run_id":       run_id,
         "image_path":   f"/static/uploads/{first_fname}",
-        "heatmap_path": f"/static/heatmaps/{heatmap_fname}",   
+        "heatmap_path": f"/static/heatmaps/{heatmap_fname}",
         "predictions":  result["top3"],
         "all_probs":    result["all_probs"],
         "class_names":  class_names,
@@ -324,7 +351,7 @@ def predict():
         "img_width":    image_meta["width"],
         "img_height":   image_meta["height"],
         "img_format":   image_meta["format"],
-        "num_images":   len(tensors),
+        "num_images":   num_images,
         "history":      session["prediction_history"],
     }
     session.modified = True
@@ -380,6 +407,5 @@ def server_error(e):
 
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
